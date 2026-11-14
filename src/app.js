@@ -77,37 +77,31 @@ function decodeCursor(cursor) {
 
 // ---------- core logic ----------
 
+// Every booking request runs in ONE transaction on ONE connection, and all
+// locks are transaction-scoped (pg_advisory_xact_lock), so they are released
+// on COMMIT/ROLLBACK even behind a connection pooler.
+
 // Level 5: at most RATE_LIMIT attempts per email in a sliding window.
 // Every attempt that gets past this check counts, whether it then succeeds or fails.
-async function checkRateLimit(client, email) {
-  try {
-    await client.query("BEGIN");
-    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 5))", [`rl:${email}`]);
-    const { rows } = await client.query(
-      `SELECT count(*)::int AS n,
-              EXTRACT(EPOCH FROM (min(at) + make_interval(secs => $2) - clock_timestamp())) AS wait
-         FROM booking_attempts
-        WHERE email = $1 AND at > clock_timestamp() - make_interval(secs => $2)`,
-      [email, RATE_WINDOW_SECONDS]
-    );
-    if (rows[0].n >= RATE_LIMIT) {
-      await client.query("COMMIT");
-      const retryAfter = Math.max(1, Math.ceil(Number(rows[0].wait)));
-      fail(429, "Too many booking attempts for this email. Try again later.", {
-        "Retry-After": String(retryAfter),
-      });
-    }
-    await client.query("INSERT INTO booking_attempts (email) VALUES ($1)", [email]);
-    await client.query("COMMIT");
-  } catch (err) {
-    await client.query("ROLLBACK").catch(() => {});
-    throw err;
+async function checkRateLimit(db, email) {
+  await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 5))", [`rl:${email}`]);
+  const { rows } = await db.query(
+    `SELECT count(*)::int AS n,
+            EXTRACT(EPOCH FROM (min(at) + make_interval(secs => $2) - clock_timestamp())) AS wait
+       FROM booking_attempts
+      WHERE email = $1 AND at > clock_timestamp() - make_interval(secs => $2)`,
+    [email, RATE_WINDOW_SECONDS]
+  );
+  if (rows[0].n >= RATE_LIMIT) {
+    const retryAfter = Math.max(1, Math.ceil(Number(rows[0].wait)));
+    fail(429, "Too many booking attempts for this email. Try again later.", {
+      "Retry-After": String(retryAfter),
+    });
   }
+  await db.query("INSERT INTO booking_attempts (email) VALUES ($1)", [email]);
 }
 
-// `db` is one dedicated client for the whole request, so a request never
-// holds one connection while waiting for another.
-async function createBooking(db, body) {
+async function bookSlot(db, body) {
   const b = body && typeof body === "object" && !Array.isArray(body) ? body : {};
 
   // Rate limit first, so invalid attempts count too.
@@ -132,6 +126,9 @@ async function createBooking(db, body) {
   if (slot.rowCount === 0) fail(404, "Slot not found");
   if (slot.rows[0].started) fail(400, "This slot has already started");
 
+  // Level 3: the partial unique index lets only one confirmed booking per slot
+  // exist. A savepoint keeps the transaction usable if the insert loses the race.
+  await db.query("SAVEPOINT book");
   try {
     const { rows } = await db.query(
       `INSERT INTO bookings (id, slot_id, name, email, status)
@@ -139,55 +136,59 @@ async function createBooking(db, body) {
        RETURNING *`,
       [crypto.randomUUID(), slotId, name, email]
     );
+    await db.query("RELEASE SAVEPOINT book");
     return { status: 201, body: toBooking(rows[0]) };
   } catch (err) {
+    await db.query("ROLLBACK TO SAVEPOINT book");
     if (err.code === "23505") fail(409, "This slot is already booked");
     throw err;
   }
 }
 
-// Level 4: the same Idempotency-Key + body always gets the same response and
-// never makes a second booking. A per-key lock makes concurrent retries wait
-// for the first one to finish instead of racing it.
-async function createBookingIdempotent(client, key, body) {
-  const lockSql = "SELECT pg_advisory_lock(hashtextextended($1, 4))";
-  const unlockSql = "SELECT pg_advisory_unlock(hashtextextended($1, 4))";
-  await client.query(lockSql, [key]);
+// Turns an HttpError into a stored-able result instead of an exception, so
+// the transaction still commits (and failed attempts still count).
+async function attempt(db, body) {
   try {
+    return await bookSlot(db, body);
+  } catch (err) {
+    if (!(err instanceof HttpError)) throw err;
+    return { status: err.status, body: { error: err.message }, headers: err.headers };
+  }
+}
+
+// Level 4: the same Idempotency-Key + body always gets the same response and
+// never makes a second booking. The per-key lock makes concurrent retries
+// wait for the first one to commit, then they replay its stored response.
+async function handleBooking(db, key, body) {
+  if (key !== undefined) {
+    await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 4))", [key]);
     const hash = sha256(canonical(body ?? null));
-    const existing = await client.query(
+    const existing = await db.query(
       "SELECT request_hash, status_code, response FROM idempotency_keys WHERE key = $1",
       [key]
     );
     if (existing.rowCount) {
       const row = existing.rows[0];
       if (row.request_hash !== hash) {
-        fail(422, "Idempotency-Key was already used with a different request body");
+        return {
+          status: 422,
+          body: { error: "Idempotency-Key was already used with a different request body" },
+        };
       }
-      return { status: row.status_code, body: row.response, replayed: true };
+      return { status: row.status_code, body: row.response };
     }
-
-    let result;
-    try {
-      result = await createBooking(client, body);
-    } catch (err) {
-      if (!(err instanceof HttpError)) throw err;
-      result = { status: err.status, body: { error: err.message }, headers: err.headers };
-    }
-
-    // Don't store rate-limit rejections or server errors: a later retry should
-    // get a real answer.
-    if (result.status !== 429 && result.status < 500) {
-      await client.query(
+    const result = await attempt(db, body);
+    // Don't store rate-limit rejections: a later retry should get a real answer.
+    if (result.status !== 429) {
+      await db.query(
         `INSERT INTO idempotency_keys (key, request_hash, status_code, response)
          VALUES ($1, $2, $3, $4)`,
         [key, hash, result.status, JSON.stringify(result.body)]
       );
     }
     return result;
-  } finally {
-    await client.query(unlockSql, [key]).catch(() => {});
   }
+  return attempt(db, body);
 }
 
 // ---------- routes ----------
@@ -268,12 +269,16 @@ api.get("/slots", async (req, res) => {
 api.post("/bookings", async (req, res) => {
   const key = req.get("Idempotency-Key");
   if (key !== undefined && !key.trim()) fail(400, "Idempotency-Key must not be empty");
-  let result;
+
   const client = await pool.connect();
+  let result;
   try {
-    result = key !== undefined
-      ? await createBookingIdempotent(client, key, req.body)
-      : await createBooking(client, req.body);
+    await client.query("BEGIN");
+    result = await handleBooking(client, key, req.body);
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
   } finally {
     client.release();
   }

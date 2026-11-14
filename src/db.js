@@ -9,6 +9,7 @@ const isLocal = /localhost|127\.0\.0\.1|host=\/tmp/.test(connectionString);
 
 const pool = new Pool({
   connectionString,
+  connectionTimeoutMillis: 10000,
   ssl: isLocal ? false : { rejectUnauthorized: false },
   max: Number(process.env.DB_POOL_MAX || 10),
 });
@@ -59,17 +60,24 @@ CREATE INDEX IF NOT EXISTS booking_attempts_email_at ON booking_attempts (email,
 
 let ready = null;
 
-// Create tables once per process. The advisory lock stops two cold starts
-// from racing on CREATE TABLE.
+// Create tables once per process. A transaction-scoped lock (released on
+// COMMIT) stops two cold starts racing on CREATE TABLE. Transaction-scoped
+// locks are used everywhere because Neon's pooler (PgBouncer, transaction
+// mode) can run each statement outside a transaction on a different server
+// connection, which breaks session-level locks.
 function ensureSchema() {
   if (!ready) {
     ready = (async () => {
       const client = await pool.connect();
       try {
-        await client.query("SELECT pg_advisory_lock(424242)");
+        await client.query("BEGIN");
+        await client.query("SELECT pg_advisory_xact_lock(7300001)");
         await client.query(SCHEMA);
+        await client.query("COMMIT");
+      } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw err;
       } finally {
-        await client.query("SELECT pg_advisory_unlock(424242)").catch(() => {});
         client.release();
       }
     })().catch((err) => {
