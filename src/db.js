@@ -68,6 +68,18 @@ let ready = null;
 function ensureSchema() {
   if (!ready) {
     ready = (async () => {
+      // Fast path: tables already exist (every request after the first deploy).
+      // CREATE ... IF NOT EXISTS still takes table locks, so skipping it avoids
+      // blocking live bookings when many cold starts happen at once.
+      const check = await pool.query(
+        `SELECT to_regclass('public.slots') IS NOT NULL
+            AND to_regclass('public.bookings') IS NOT NULL
+            AND to_regclass('public.one_confirmed_booking_per_slot') IS NOT NULL
+            AND to_regclass('public.idempotency_keys') IS NOT NULL
+            AND to_regclass('public.booking_attempts_email_at') IS NOT NULL AS ok`
+      );
+      if (check.rows[0].ok) return;
+
       const client = await pool.connect();
       try {
         await client.query("BEGIN");

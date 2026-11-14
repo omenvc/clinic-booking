@@ -270,17 +270,26 @@ api.post("/bookings", async (req, res) => {
   const key = req.get("Idempotency-Key");
   if (key !== undefined && !key.trim()) fail(400, "Idempotency-Key must not be empty");
 
-  const client = await pool.connect();
+  // Retry the whole transaction if Postgres aborts it with a deadlock or
+  // serialization failure; the retry is safe because nothing was committed.
   let result;
-  try {
-    await client.query("BEGIN");
-    result = await handleBooking(client, key, req.body);
-    await client.query("COMMIT");
-  } catch (err) {
-    await client.query("ROLLBACK").catch(() => {});
-    throw err;
-  } finally {
-    client.release();
+  for (let attemptNo = 1; ; attemptNo++) {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      result = await handleBooking(client, key, req.body);
+      await client.query("COMMIT");
+      break;
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      if (["40P01", "40001"].includes(err.code) && attemptNo < 4) {
+        await new Promise((r) => setTimeout(r, 25 * attemptNo + Math.random() * 50));
+        continue;
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
   }
   if (result.headers) res.set(result.headers);
   res.status(result.status).json(result.body);
