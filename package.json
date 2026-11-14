@@ -4,7 +4,7 @@
   "description": "Clinic appointment booking API and web page",
   "main": "src/app.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node init && node server.js",
     "test": "node --test --test-concurrency=1 test/api.test.js"
   },
   "engines": {
